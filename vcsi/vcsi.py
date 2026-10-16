@@ -1686,9 +1686,10 @@ def process_file(path, args):
     is_url = False
     url_path = ""
     try:
-        _, _, url_path, _, _, _ = urlparse(path)
+        _, netloc, url_path, _, _, _ = urlparse(path)
+        assert netloc
         is_url = True
-    except ValueError:
+    except ValueError, AssertionError:
         pass
 
     if not is_url and not os.path.exists(path):
