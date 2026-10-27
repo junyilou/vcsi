@@ -1,13 +1,10 @@
-import json
 import argparse
+import json
 from argparse import ArgumentTypeError
 
 import pytest
 
-from vcsi.vcsi import MediaInfo
-from vcsi.vcsi import Grid, grid_desired_size
-from vcsi.vcsi import timestamp_generator
-
+from vcsi.vcsi import Grid, MediaInfo, grid_desired_size, timestamp_generator
 
 FFPROBE_EXAMPLE_JSON_PATH = "tests/data/bbb_ffprobe.json"
 

@@ -1,12 +1,11 @@
 from argparse import ArgumentTypeError
-from unittest.mock import patch, Mock, PropertyMock, MagicMock
+from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import pytest
 
-from vcsi.vcsi import (
-    Grid, mxn_type, Color, TimestampPosition, cleanup, save_image,
-    compute_timestamp_position, max_line_length, draw_metadata,
-)
+from vcsi.vcsi import (Color, Grid, TimestampPosition, cleanup,
+                       compute_timestamp_position, draw_metadata,
+                       max_line_length, mxn_type, save_image)
 
 
 def test_grid_default():
