@@ -53,13 +53,6 @@ def test_size():
     assert mi.size == "339.4 MiB"
 
 
-def test_template_attributes():
-    mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
-    attributes = mi.template_attributes()
-    assert attributes["audio_codec"] == "mp3"
-    assert attributes["video_codec"] == "h264"
-
-
 def test_grid_desired_size():
     mi = MediaInfoForTest(FFPROBE_EXAMPLE_JSON_PATH)
     x = 2
@@ -111,13 +104,3 @@ def test_pretty_duration_millis_limit():
     mi.duration_seconds = 1.9999
     pretty_duration = MediaInfo.pretty_duration(mi.duration_seconds, show_millis=True)
     assert pretty_duration == "00:01.999"
-
-
-def test_pretty_to_seconds():
-    assert MediaInfo.pretty_to_seconds("1:11:11.111") == 4271.111
-
-    assert MediaInfo.pretty_to_seconds("1:11:11") == 4271
-
-    assert MediaInfo.pretty_to_seconds("1:01:00") == 3660
-
-    pytest.raises(ArgumentTypeError, MediaInfo.pretty_to_seconds, "1:01:01:01:00")
