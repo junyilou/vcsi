@@ -5,9 +5,12 @@
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
-from argparse import ArgumentTypeError
+import time
+import traceback
+from pathlib import Path
 
 try:
     from subprocess import DEVNULL
@@ -25,7 +28,7 @@ from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
 
 try:
     import fcntl
@@ -114,6 +117,39 @@ DEFAULT_TIMESTAMP_POSITION = TimestampPosition.se
 HIGH_RES_PIXELS = 3840 * 2160
 EIGHT_K_PIXELS = 7680 * 4320
 _HEAVY_THREAD_LOCK = threading.Lock()
+
+
+class Cancelled(Exception):
+    """Raised when the caller asked to stop the current contact sheet."""
+
+
+class Reporter:
+    """Emit structured JSON lines on stdout when ``--events`` is used.
+
+    vcsiWeb runs vcsi as a subprocess and needs machine-readable progress
+    instead of scraping the human readable terminal output.
+    """
+
+    def __init__(self, events=False):
+        self.events = events
+        self.cancelled = threading.Event()
+
+    def emit(self, event, **fields):
+        if not self.events:
+            return
+        payload = {"event": event, "time": round(time.time(), 3)}
+        payload.update(fields)
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+    def info(self, message):
+        if self.events:
+            print(message, file=sys.stderr, flush=True)
+        else:
+            print(message, flush=True)
+
+
+REPORTER = Reporter()
 
 
 def _total_memory_bytes():
@@ -590,6 +626,49 @@ class MediaCapture(object):
         cmd += ["-vf", ",".join(filters), "-an", "-sn", "-dn", "-y", out_path]
         return cmd
 
+    @staticmethod
+    def _stop(process):
+        try:
+            process.terminate()
+            process.wait(timeout=3)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            process.kill()
+            process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _run_ffmpeg(self, cmd):
+        """Run one ffmpeg command, polling so a cancellation is prompt."""
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                    errors="replace") as errors:
+            process = subprocess.Popen(
+                cmd, stdin=DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=errors, text=True)
+            started = time.monotonic()
+            while True:
+                try:
+                    process.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if REPORTER.cancelled.is_set():
+                    self._stop(process)
+                    raise Cancelled()
+                if self.timeout and time.monotonic() - started >= self.timeout:
+                    self._stop(process)
+                    raise subprocess.TimeoutExpired(cmd, self.timeout)
+            errors.seek(0)
+            stderr = errors.read()
+        if REPORTER.cancelled.is_set():
+            raise Cancelled()
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode, cmd, output="", stderr=stderr)
+        return stderr
+
     def make_capture(self, time, width, height, out_path="out.png"):
         """Capture a frame at given time with given width and height using ffmpeg.
 
@@ -617,13 +696,10 @@ class MediaCapture(object):
             cmd = self._build_command(time, width, height, out_path, hwaccel, keyframe_seek)
             try:
                 with _heavy_capture_lock(self._is_heavy(hwaccel)):
-                    result = subprocess.run(
-                        cmd, stdin=DEVNULL, capture_output=True, text=True,
-                        encoding="utf-8", errors="replace", check=True,
-                        timeout=self.timeout)
+                    stderr = self._run_ffmpeg(cmd)
             except FileNotFoundError:
                 error_exit("Could not find 'ffmpeg' executable. Please make sure "
-                           "ffmpeg/ffprobe is installed and is in your PATH.")
+                           "ffmpeg/ffprobe are installed and are in your PATH.")
             except subprocess.TimeoutExpired as ex:
                 last_error = ex
                 if hwaccel is None:
@@ -636,7 +712,7 @@ class MediaCapture(object):
                 continue
 
             if keyframe_seek:
-                offsets = re.findall(r"pts_time:\s*(-?\d+(?:\.\d+)?)", result.stderr)
+                offsets = re.findall(r"pts_time:\s*(-?\d+(?:\.\d+)?)", stderr)
                 if offsets:
                     offset = float(offsets[-1])
                     # showinfo reports timestamps relative to the seek point.
@@ -651,13 +727,12 @@ class MediaCapture(object):
                 "Use --seek-mode keyframe for very large videos, or raise "
                 "--ffmpeg-timeout.".format(self.timeout, self.path))
         if last_error is not None:
-            error = f"""
-                ffmpeg had an error while decoding the file:",
-                Command: '{" ".join(last_error.cmd)}',
-                Exit code: {last_error.returncode},
-                Output: {last_error.stderr}
-                """
-            raise RuntimeError(error)
+            output = (last_error.stderr or "").strip()
+            if len(output) > 4000:
+                output = output[-4000:]
+            raise RuntimeError(
+                "ffmpeg failed with exit code {} while decoding '{}': {}".format(
+                    last_error.returncode, self.path, output))
         return None
 
     def compute_avg_color(self, image_path):
@@ -727,6 +802,21 @@ def timestamp_generator(media_info, args):
         time += capture_interval
 
 
+def write_preview(source, target, width=480, quality=78):
+    """Write a small JPEG preview of a captured frame, if possible."""
+    try:
+        with Image.open(source) as image:
+            image = image.convert("RGB")
+            if width and image.width > width:
+                height = max(1, round(image.height * width / image.width))
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            image.save(target, format="JPEG", quality=quality, optimize=True)
+        return target
+    except Exception:
+        return None
+
+
 def capture_frames(media_info, media_capture, args):
     """Capture the grid's frames.  The lite build always keeps every frame;
     there is no sampling/selection step."""
@@ -736,25 +826,40 @@ def capture_frames(media_info, media_capture, args):
         width=args.vcs_width,
         horizontal_margin=args.grid_horizontal_spacing)
 
+    work_dir = getattr(args, "work_dir", None)
+    preview_dir = Path(work_dir) / "preview" if getattr(args, "preview", False) and work_dir else None
     frames = []
-    for i, (timestamp, pretty_time) in enumerate(timestamp_generator(media_info, args)):
-        print("Sampling... {}/{}".format(i + 1, args.num_samples), end="\r")
-        fd, filename = tempfile.mkstemp(suffix=".bmp")
-        try:
-            offset = media_capture.make_capture(
-                pretty_time, desired_size[0], desired_size[1], filename)
-            if offset is not None:
-                timestamp = max(0.0, timestamp + offset)
-        except BaseException:
-            try:
-                os.unlink(filename)
-            except OSError:
-                pass
-            raise
-        finally:
+    try:
+        for i, (timestamp, pretty_time) in enumerate(timestamp_generator(media_info, args)):
+            if not REPORTER.events:
+                print("Sampling... {}/{}".format(i + 1, args.num_samples), end="\r")
+            fd, filename = tempfile.mkstemp(suffix=".bmp", dir=work_dir)
             os.close(fd)
-        frames.append(Frame(filename=filename, timestamp=timestamp))
-    print()
+            try:
+                offset = media_capture.make_capture(
+                    pretty_time, desired_size[0], desired_size[1], filename)
+                if offset is not None:
+                    timestamp = max(0.0, timestamp + offset)
+            except BaseException:
+                try:
+                    os.unlink(filename)
+                except OSError:
+                    pass
+                raise
+            preview = None
+            if preview_dir is not None:
+                preview = write_preview(filename, preview_dir / ("%04d.jpg" % (i + 1)),
+                                        getattr(args, "preview_width", 480),
+                                        getattr(args, "preview_quality", 78))
+            REPORTER.emit("frame", index=i + 1, total=args.num_samples,
+                          timestamp=round(timestamp, 3),
+                          preview=str(preview) if preview is not None else None)
+            frames.append(Frame(filename=filename, timestamp=timestamp))
+    except BaseException:
+        cleanup(frames)
+        raise
+    if not REPORTER.events:
+        print()
 
     frames.sort(key=lambda frame: frame.timestamp)
     return frames
@@ -884,12 +989,30 @@ def load_font(args, font_path, font_size, default_font_path):
             error_exit("Cannot load font: {}".format(font_path))
 
 
+def composite_at(base, overlay, x, y):
+    """Alpha-composite a small overlay, cropping instead of going off-canvas."""
+    left, top = max(0, -x), max(0, -y)
+    right = min(overlay.width, base.width - x)
+    bottom = min(overlay.height, base.height - y)
+    if right <= left or bottom <= top:
+        return
+    if (left, top, right, bottom) != (0, 0, overlay.width, overlay.height):
+        overlay = overlay.crop((left, top, right, bottom))
+    base.alpha_composite(overlay, (max(0, x), max(0, y)))
+
+
 def compose_contact_sheet(
         media_info,
         frames,
         args):
     """Creates a video contact sheet with the media information in a header
-    and the selected frames arranged on a mxn grid with optional timestamps
+    and the selected frames arranged on a mxn grid with optional timestamps.
+
+    The lite build used to allocate five full-size RGBA canvases.  A 3x20
+    sheet at the default width is about 33 MB per canvas, which is a lot for
+    the small server this runs on.  The sheet is now composed directly on a
+    single canvas; timestamps use small per-cell overlays so their background
+    colour can still be translucent.
     """
     desired_size = grid_desired_size(
         args.grid,
@@ -915,26 +1038,13 @@ def compose_contact_sheet(
     if args.metadata_position == "hidden":
         header_height = 0
 
-    final_image_width = width
-    final_image_height = height + header_height
-    transparent = (255, 255, 255, 0)
-
-    image = Image.new("RGBA", (final_image_width, final_image_height), args.background_color)
-    image_capture_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-    image_header_text_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-    image_timestamp_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-    image_timestamp_text_layer = Image.new("RGBA", (final_image_width, final_image_height), transparent)
-
-    draw_header_text_layer = ImageDraw.Draw(image_header_text_layer)
-    draw_timestamp_layer = ImageDraw.Draw(image_timestamp_layer)
-    draw_timestamp_text_layer = ImageDraw.Draw(image_timestamp_text_layer)
+    image = Image.new("RGBA", (width, height + header_height), args.background_color)
+    draw = ImageDraw.Draw(image)
     h = 0
 
     def draw_metadata_helper():
-        """Draw metadata with fixed arguments
-        """
         return draw_metadata(
-            draw_header_text_layer,
+            draw,
             args,
             header_line_height=header_line_height,
             header_lines=header_lines,
@@ -942,132 +1052,128 @@ def compose_contact_sheet(
             header_font_color=args.metadata_font_color,
             start_height=h)
 
-    # draw metadata
     if args.metadata_position == "top":
         h = draw_metadata_helper()
 
-    # draw capture grid
-    w = 0
     frames = sorted(frames, key=lambda x: x.timestamp)
     for i, frame in enumerate(frames):
-        f = Image.open(frame.filename)
-        f.putalpha(args.capture_alpha)
-        image_capture_layer.paste(f, (w, h))
+        column = i % args.grid.x
+        row = i // args.grid.x
+        x = column * (desired_size[0] + args.grid_horizontal_spacing)
+        y = h + row * (desired_size[1] + args.grid_vertical_spacing)
 
-        # show timestamp
-        if args.show_timestamp:
-            timestamp_time = MediaInfo.pretty_duration(frame.timestamp, show_centis=True)
-            timestamp_duration = MediaInfo.pretty_duration(media_info.duration_seconds, show_centis=True)
-            parsed_time = MediaInfo.parse_duration(frame.timestamp)
-            parsed_duration = MediaInfo.parse_duration(media_info.duration_seconds)
-            timestamp_args = {
-                "TIME": timestamp_time,
-                "DURATION": timestamp_duration,
-                "THUMBNAIL_NUMBER": i + 1,
-                "H": str(parsed_time["hours"]).zfill(2),
-                "M": str(parsed_time["minutes"]).zfill(2),
-                "S": str(parsed_time["seconds"]).zfill(2),
-                "c": str(parsed_time["centis"]).zfill(2),
-                "m": str(parsed_time["millis"]).zfill(3),
-                "dH": str(parsed_duration["hours"]).zfill(2),
-                "dM": str(parsed_duration["minutes"]).zfill(2),
-                "dS": str(parsed_duration["seconds"]).zfill(2),
-                "dc": str(parsed_duration["centis"]).zfill(2),
-                "dm": str(parsed_duration["millis"]).zfill(3)
-            }
-            timestamp_text = args.timestamp_format.format(**timestamp_args)
-            text_bbox = timestamp_font.getbbox(timestamp_text)
-            (left, top, right, bottom) = text_bbox
-            text_width = abs(right - left)
-            text_height = abs(top - bottom)
-            text_size = (text_width, text_height)
+        with Image.open(frame.filename) as source:
+            cell = source.convert("RGBA")
+        if args.capture_alpha != 255:
+            alpha = cell.getchannel("A").point(
+                lambda value: value * args.capture_alpha // 255)
+            cell.putalpha(alpha)
+        if cell.size != desired_size:
+            cell = cell.resize(desired_size, Image.Resampling.LANCZOS)
+        if args.capture_alpha == 255:
+            image.paste(cell, (x, y))
+        else:
+            image.alpha_composite(cell, (x, y))
+        del cell
 
-            # draw rectangle
-            rectangle_hpadding = args.timestamp_horizontal_padding
-            rectangle_vpadding = args.timestamp_vertical_padding
+        if not args.show_timestamp:
+            continue
 
-            upper_left, bottom_right = compute_timestamp_position(args, w, h, text_size, desired_size,
-                                                                  rectangle_hpadding, rectangle_vpadding)
+        timestamp_time = MediaInfo.pretty_duration(frame.timestamp, show_centis=True)
+        timestamp_duration = MediaInfo.pretty_duration(media_info.duration_seconds, show_centis=True)
+        parsed_time = MediaInfo.parse_duration(frame.timestamp)
+        parsed_duration = MediaInfo.parse_duration(media_info.duration_seconds)
+        timestamp_args = {
+            "TIME": timestamp_time,
+            "DURATION": timestamp_duration,
+            "THUMBNAIL_NUMBER": i + 1,
+            "H": str(parsed_time["hours"]).zfill(2),
+            "M": str(parsed_time["minutes"]).zfill(2),
+            "S": str(parsed_time["seconds"]).zfill(2),
+            "c": str(parsed_time["centis"]).zfill(2),
+            "m": str(parsed_time["millis"]).zfill(3),
+            "dH": str(parsed_duration["hours"]).zfill(2),
+            "dM": str(parsed_duration["minutes"]).zfill(2),
+            "dS": str(parsed_duration["seconds"]).zfill(2),
+            "dc": str(parsed_duration["centis"]).zfill(2),
+            "dm": str(parsed_duration["millis"]).zfill(3),
+        }
+        timestamp_text = args.timestamp_format.format(**timestamp_args)
+        (left, top, right, bottom) = timestamp_font.getbbox(timestamp_text)
+        text_width = abs(right - left)
+        text_height = abs(top - bottom)
 
-            if not args.timestamp_border_mode:
-                draw_timestamp_layer.rectangle(
-                    [upper_left, bottom_right],
-                    fill=args.timestamp_background_color
-                )
-            else:
-                offset_factor = args.timestamp_border_size
-                offsets = [
-                    (1, 0),
-                    (-1, 0),
-                    (0, 1),
-                    (0, -1),
-                    (1, 1),
-                    (1, -1),
-                    (-1, 1),
-                    (-1, -1)
-                ]
+        rectangle_hpadding = args.timestamp_horizontal_padding
+        rectangle_vpadding = args.timestamp_vertical_padding
+        upper_left, _ = compute_timestamp_position(
+            args, 0, 0, (text_width, text_height), desired_size,
+            rectangle_hpadding, rectangle_vpadding)
+        border = args.timestamp_border_size if args.timestamp_border_mode else 0
+        extra = 0 if args.timestamp_border_mode else 1
 
-                final_offsets = []
-                for offset_counter in range(1, offset_factor + 1):
-                    final_offsets += [(x[0] * offset_counter, x[1] * offset_counter) for x in offsets]
+        overlay = Image.new("RGBA",
+                            (text_width + 2 * rectangle_hpadding + 2 * border + extra,
+                             text_height + 2 * rectangle_vpadding + 2 * border + extra),
+                            (0, 0, 0, 0))
+        text_left = border + rectangle_hpadding
+        text_top = border + rectangle_vpadding
+        if not args.timestamp_border_mode:
+            background = Image.new(
+                "RGBA",
+                (text_width + 2 * rectangle_hpadding + extra,
+                 text_height + 2 * rectangle_vpadding + extra),
+                (0, 0, 0, 0))
+            ImageDraw.Draw(background).rectangle(
+                [(0, 0), (background.width - 1, background.height - 1)],
+                fill=args.timestamp_background_color)
+            overlay.alpha_composite(background, (border, border))
+            del background
 
-                for offset in final_offsets:
-                    # draw border first
-                    draw_timestamp_text_layer.text(
-                        (
-                            upper_left[0] + rectangle_hpadding + offset[0],
-                            upper_left[1] + rectangle_vpadding + offset[1]
-                        ),
-                        timestamp_text,
-                        font=timestamp_font,
-                        fill=args.timestamp_border_color,
-                        anchor="lt"
-                    )
+        text_layer = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
+        text_draw = ImageDraw.Draw(text_layer)
+        if args.timestamp_border_mode:
+            offsets = [(1, 0), (-1, 0), (0, 1), (0, -1),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)]
+            final_offsets = [((dx * factor), (dy * factor))
+                             for factor in range(1, args.timestamp_border_size + 1)
+                             for dx, dy in offsets]
+            for dx, dy in final_offsets:
+                text_draw.text((text_left + dx, text_top + dy), timestamp_text,
+                               font=timestamp_font,
+                               fill=args.timestamp_border_color, anchor="lt")
+        text_draw.text((text_left, text_top), timestamp_text,
+                       font=timestamp_font, fill=args.timestamp_font_color,
+                       anchor="lt")
+        overlay.alpha_composite(text_layer)
+        del text_layer
+        composite_at(image, overlay,
+                     x + upper_left[0] - border, y + upper_left[1] - border)
 
-            # draw timestamp
-            draw_timestamp_text_layer.text(
-                (
-                    upper_left[0] + rectangle_hpadding,
-                    upper_left[1] + rectangle_vpadding
-                ),
-                timestamp_text,
-                font=timestamp_font,
-                fill=args.timestamp_font_color,
-                anchor="lt"
-            )
-
-        # update x position for next frame
-        w += desired_size[0] + args.grid_horizontal_spacing
-
-        # update y position
-        if (i + 1) % args.grid.x == 0:
-            h += desired_size[1] + args.grid_vertical_spacing
-
-        # update x position
-        if (i + 1) % args.grid.x == 0:
-            w = 0
-
-    # draw metadata
+    h += args.grid.y * (desired_size[1] + args.grid_vertical_spacing)
     if args.metadata_position == "bottom":
         h -= args.grid_vertical_spacing
-        h = draw_metadata_helper()
+        draw_metadata_helper()
 
-    # alpha blend
-    out_image = Image.alpha_composite(image, image_capture_layer)
-    out_image = Image.alpha_composite(out_image, image_header_text_layer)
-    out_image = Image.alpha_composite(out_image, image_timestamp_layer)
-    out_image = Image.alpha_composite(out_image, image_timestamp_text_layer)
-
-    return out_image
+    return image
 
 
 def save_image(args, image, output_path):
     """Save the image to `output_path`."""
     image = image.convert("RGB")
+    image_format = getattr(args, "image_format", None)
+    if not isinstance(image_format, str):
+        image_format = Path(output_path).suffix.lstrip(".") or "jpg"
+    image_format = image_format.lower()
+    formats = {"jpg": "JPEG", "jpeg": "JPEG", "webp": "WEBP", "png": "PNG"}
+    if (pil_format := formats.get(image_format)) is None:
+        return False
     try:
-        image.save(output_path, optimize=True, quality=args.image_quality)
+        options = {"optimize": True}
+        if pil_format in ("JPEG", "WEBP"):
+            options["quality"] = args.image_quality
+        image.save(output_path, format=pil_format, **options)
         return True
-    except KeyError:
+    except (KeyError, OSError, ValueError):
         return False
 
 
@@ -1097,18 +1203,24 @@ def mxn_type(string):
 
 def error(message):
     """Print an error message."""
-    print("[ERROR] %s" % (message,))
+    print("[ERROR] %s" % (message,), file=sys.stderr, flush=True)
 
 
 def error_exit(message):
     """Print an error message and exit"""
     error(message)
-    sys.exit(-1)
+    REPORTER.emit("error", error=message)
+    raise SystemExit(-1)
+
+
+def request_cancel(signum=None, frame=None):
+    """Ask the current run to stop at the next safe point."""
+    REPORTER.cancelled.set()
 
 
 def main():
     """Program entry point.  This is the deliberately small vcsi-lite CLI:
-    only the options used by vcsi_ui are exposed."""
+    only the options used by vcsiWeb are exposed."""
     parser = argparse.ArgumentParser(
         description="Create a video contact sheet (vcsi-lite)")
     parser.add_argument("filenames", nargs="+")
@@ -1138,6 +1250,56 @@ def main():
         action="store_true",
         help="Skip the file if the output image already exists.",
         dest="no_overwrite")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=Config.contact_sheet_width,
+        metavar="PX",
+        help="Contact sheet width in pixels.",
+        dest="vcs_width")
+    parser.add_argument(
+        "--image-quality",
+        type=int,
+        default=Config.quality,
+        metavar="N",
+        help="JPEG/WebP quality, 1-100.",
+        dest="image_quality")
+    parser.add_argument(
+        "--image-format",
+        choices=("jpg", "jpeg", "webp", "png"),
+        default=Config.format,
+        help="Output image format.",
+        dest="image_format")
+    parser.add_argument(
+        "--events",
+        action="store_true",
+        help="Write JSONL progress events to stdout.",
+        dest="events")
+    parser.add_argument(
+        "--work-dir",
+        default="",
+        metavar="DIR",
+        help="Directory for temporary frames and preview images.",
+        dest="work_dir")
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Write a small JPEG preview for every captured frame.",
+        dest="preview")
+    parser.add_argument(
+        "--preview-width",
+        type=int,
+        default=480,
+        metavar="PX",
+        help="Width of preview JPEGs.",
+        dest="preview_width")
+    parser.add_argument(
+        "--preview-quality",
+        type=int,
+        default=78,
+        metavar="N",
+        help="JPEG quality of previews.",
+        dest="preview_quality")
     parser.add_argument(
         "--hwaccel",
         choices=("auto", "none", "videotoolbox"),
@@ -1173,15 +1335,13 @@ def main():
         version="%(prog)s version {version}".format(version=__version__))
 
     # Internal defaults.  These are intentionally not command-line options:
-    # vcsi_ui uses the upstream defaults for everything except the options
+    # vcsiWeb uses the upstream defaults for everything except the options
     # added above.
     parser.set_defaults(
         background_color=Color(0x00, 0x00, 0x00, 0xFF),
         capture_alpha=Config.capture_alpha,
         grid_horizontal_spacing=Config.grid_horizontal_spacing,
         grid_vertical_spacing=Config.grid_vertical_spacing,
-        image_format=Config.format,
-        image_quality=Config.quality,
         metadata_font=Config.metadata_font,
         metadata_font_color=Color(0xFF, 0xFF, 0xFF, 0xFF),
         metadata_font_size=Config.metadata_font_size,
@@ -1203,12 +1363,57 @@ def main():
         timestamp_position=Config.timestamp_position,
         timestamp_vertical_margin=Config.timestamp_vertical_margin,
         timestamp_vertical_padding=Config.timestamp_vertical_padding,
-        vcs_width=Config.contact_sheet_width,
     )
 
     args = parser.parse_args()
+
+    global REPORTER
+    REPORTER = Reporter(events=args.events)
+    signal.signal(signal.SIGINT, request_cancel)
+    signal.signal(signal.SIGTERM, request_cancel)
+
+    def fail(message):
+        if args.events:
+            REPORTER.emit("error", error=message)
+        parser.error(message)
+
+    if args.start_delay_percent < 0 or args.end_delay_percent < 0:
+        fail("delay percentages must not be negative")
+    if args.start_delay_percent + args.end_delay_percent >= 100:
+        fail("start and end delay percentages must sum to less than 100")
+    if args.grid.x * args.grid.y > 600:
+        fail("the grid must not contain more than 600 cells")
+    if args.vcs_width < 200:
+        fail("the contact sheet width must be at least 200 pixels")
+    if not 1 <= args.image_quality <= 100:
+        fail("image quality must be between 1 and 100")
+    if args.preview and not args.work_dir:
+        fail("--preview requires --work-dir")
+    if args.work_dir:
+        os.makedirs(args.work_dir, exist_ok=True)
+
+    REPORTER.emit("run_start", version=__version__, files=args.filenames,
+                  grid=str(args.grid), events=True)
+    status = 0
     for path in args.filenames:
-        process_file(path, args)
+        if REPORTER.cancelled.is_set():
+            status = 130
+            REPORTER.emit("cancelled", file=path)
+            break
+        try:
+            process_file(path, args)
+        except Cancelled:
+            status = 130
+            REPORTER.emit("cancelled", file=path)
+            break
+        except SystemExit:
+            raise
+        except Exception as exp:
+            status = 1
+            REPORTER.emit("error", file=path, error=str(exp),
+                          traceback=traceback.format_exc())
+            error(str(exp))
+    sys.exit(status)
 
 
 def process_file(path, args):
@@ -1223,34 +1428,56 @@ def process_file(path, args):
         output_path = os.path.join(output_path, os.path.basename(path) + "." + args.image_format)
 
     if args.no_overwrite and os.path.exists(output_path):
-        print("[INFO] contact-sheet already exists, skipping: {}".format(output_path))
+        REPORTER.emit("skipped", file=path, output=output_path, reason="exists")
+        REPORTER.info("[INFO] contact-sheet already exists, skipping: {}".format(output_path))
         return
 
-    print("Processing {}...".format(path))
+    started = time.monotonic()
+    REPORTER.emit("start", file=path, output=output_path, grid=str(args.grid),
+                  cells=args.grid.x * args.grid.y)
+    REPORTER.info("Processing {}...".format(path))
 
-    media_info = MediaInfo(path)
-    media_capture = MediaCapture(
-        path,
-        media_info=media_info,
-        hwaccel=args.hwaccel,
-        seek_mode=args.seek_mode,
-        ffmpeg_threads=args.ffmpeg_threads,
-        timeout=args.ffmpeg_timeout,
-    )
+    frames = []
+    try:
+        media_info = MediaInfo(path)
+        REPORTER.emit(
+            "probe", file=path, output=output_path,
+            duration=round(media_info.duration_seconds, 3),
+            bytes=media_info.size_bytes,
+            width=media_info.display_width, height=media_info.display_height,
+            sample_width=media_info.sample_width, sample_height=media_info.sample_height,
+            fps=media_info.frame_rate, codec=media_info.video_codec,
+            audio=media_info.audio_codec, cells=args.grid.x * args.grid.y)
+        media_capture = MediaCapture(
+            path,
+            media_info=media_info,
+            hwaccel=args.hwaccel,
+            seek_mode=args.seek_mode,
+            ffmpeg_threads=args.ffmpeg_threads,
+            timeout=args.ffmpeg_timeout,
+        )
 
-    args.num_samples = args.grid.x * args.grid.y
-    frames = capture_frames(media_info, media_capture, args)
+        args.num_samples = args.grid.x * args.grid.y
+        frames = capture_frames(media_info, media_capture, args)
 
-    print("Composing contact sheet...")
-    image = compose_contact_sheet(media_info, frames, args)
+        if REPORTER.cancelled.is_set():
+            raise Cancelled()
+        REPORTER.emit("compose", file=path)
+        REPORTER.info("Composing contact sheet...")
+        image = compose_contact_sheet(media_info, frames, args)
 
-    is_save_successful = save_image(args, image, output_path)
-
-    print("Cleaning up temporary files...")
-    cleanup(frames)
-
-    if not is_save_successful:
-        error_exit("Unsupported image format: %s." % (args.image_format,))
+        if REPORTER.cancelled.is_set():
+            raise Cancelled()
+        is_save_successful = save_image(args, image, output_path)
+        if not is_save_successful:
+            error_exit("Unsupported image format: %s." % (args.image_format,))
+        REPORTER.emit(
+            "done", file=path, output=output_path, cells=args.num_samples,
+            seconds=round(time.monotonic() - started, 3),
+            bytes=os.path.getsize(output_path) if os.path.exists(output_path) else 0)
+    finally:
+        cleanup(frames)
+        REPORTER.info("Cleaning up temporary files...")
 
 
 if __name__ == "__main__":
